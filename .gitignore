@@ -1,0 +1,31 @@
+# secrets
+.env
+*.key
+*.pem
+
+# private data / results
+rounds/
+memory/
+*.csv
+*.pkl
+*.json
+*.jsonl
+*.log
+
+.env
+
+# notebooks checkpoints
+.ipynb_checkpoints/
+
+# python
+.venv/
+__pycache__/
+*.pyc
+data
+# local
+.DS_Store
+credentials.json
+.env
+
+third_party
+.claude
