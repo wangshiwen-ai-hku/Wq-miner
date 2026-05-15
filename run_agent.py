@@ -36,6 +36,9 @@ Examples
 
     # Larger search per round
     python run_agent.py --pairs-per-round 8 --modes-per-pair 3
+
+    # Parallelize Gemini generation before WQ simulation
+    python run_agent.py --pairs-per-round 8 --modes-per-pair 3 --llm-workers 6
 """
 
 import os

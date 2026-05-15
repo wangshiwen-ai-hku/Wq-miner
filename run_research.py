@@ -43,7 +43,7 @@ if __name__ == "__main__":
     print("=" * 64)
     print("🔬  EVOLUTIONARY ALPHA MINER — Research Agent")
     print("=" * 64)
-    print("  Mode:  LLM-only (no WQ simulation budget consumed)")
+    print("  Mode:  WQ-field-grounded LLM (no WQ simulation budget consumed)")
     print("  Goal:  produce hypotheses + queue seed candidates for")
     print("         later batched validation.")
     print("=" * 64)

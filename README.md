@@ -79,6 +79,7 @@ caffeinate -i bash run_loop.sh
 
 > [!IMPORTANT]
 > 定期更新 `seed_pool.py` 中的因子，可以引导 Agent 探索更具潜力的子空间，避免因过度挖掘导致的收益衰减。
+> 很重要： `llm_hybridizer.py` 中`SYSTEM_PROMPT` !!!!!
 
 ---
 

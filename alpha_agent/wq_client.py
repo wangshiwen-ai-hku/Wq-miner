@@ -14,7 +14,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import requests
+try:
+    import requests
+except ModuleNotFoundError:
+    requests = None
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -84,6 +87,11 @@ class WQBrainClient:
         max_retries: int = 3,
         poll_interval: float = 10.0,
     ):
+        if requests is None:
+            raise ModuleNotFoundError(
+                "requests is required for WQ Brain API access. "
+                "Install project dependencies with `pip install -r requirements.txt`."
+            )
         self.session = requests.Session()
         self.credentials_path = Path(credentials_path)
         self.settings = {**DEFAULT_SETTINGS, **(settings or {})}
@@ -523,9 +531,13 @@ class WQBrainClient:
         Run all pre-submission checks for an alpha.
 
         Checks:
-        1. All IS checks pass (from /alphas/{id}/check)
-        2. Self-correlation < max_self_corr (default 0.7)
-        3. Performance after > before + min_performance_gain
+        1. All non-self-correlation IS checks pass (from /alphas/{id}/check)
+        2. Performance after > before + min_performance_gain
+
+        Self-correlation is recorded when present in the first /check response,
+        but it is not retried and does not block readiness. In practice the
+        performance contribution endpoint is the cheaper, stronger gate for
+        whether a PASS alpha is useful enough to enter the seed pool.
 
         Returns:
             Dict with keys:
@@ -548,9 +560,12 @@ class WQBrainClient:
             "all_checks_passed": False,
             "reason": "",
         }
+        reasons = []
+        performance_available = False
 
         # ── Step 1: Run /check and verify all IS checks pass ──
         logger.info(f"   🔍 Running IS checks for {alpha_id}...")
+        checks = []
         for attempt in range(self.max_retries):
             check_r = self._safe_get(
                 f"{self.BASE_URL}/alphas/{alpha_id}/check"
@@ -563,24 +578,25 @@ class WQBrainClient:
                 except Exception:
                     pass
             time.sleep(5)
-        else:
-            result["reason"] = "Failed to retrieve IS checks"
-            return result
 
-        # Check all IS checks pass
+        # Check all non-self-correlation IS checks pass. SELF_CORRELATION is
+        # noisy/slow to populate after simulation, so performance gain below
+        # decides whether a PASS alpha is useful for the seed pool.
         failed = [
             c["name"] for c in checks
             if c.get("result") in ("FAIL", "ERROR")
+            and c.get("name") != "SELF_CORRELATION"
         ]
-        if failed:
-            result["reason"] = f"IS checks failed: {', '.join(failed)}"
-            return result
-        result["all_checks_passed"] = True
+        if not checks:
+            reasons.append("Failed to retrieve IS checks")
+        elif failed:
+            reasons.append(f"IS checks failed: {', '.join(failed)}")
+        else:
+            result["all_checks_passed"] = True
 
-        # Extract self-correlation from the IS check results.
-        # The SELF_CORRELATION check may not carry a numeric `value` immediately
-        # after simulation — retry the /check endpoint a few times before
-        # falling back to the dedicated /correlations/self endpoint.
+        # Extract self-correlation from the initial IS check results only.
+        # Do not retry /check and do not call /correlations/self here; if
+        # self-corr is missing, leave -1.0 and continue to performance.
         def _extract_self_corr_from_checks(chks) -> float:
             for c in chks:
                 if c["name"] == "SELF_CORRELATION":
@@ -590,88 +606,55 @@ class WQBrainClient:
             return -1.0
 
         result["self_corr"] = _extract_self_corr_from_checks(checks)
+        if result["self_corr"] >= 0:
+            logger.info(f"   📊 Self-correlation: {result['self_corr']:.4f} (recorded only)")
+        else:
+            logger.info("   📊 Self-correlation: unavailable in initial /check; skipping retry")
 
-        # ── Step 2: Retry /check if self_corr value wasn't populated yet ──
-        if result["self_corr"] < 0:
-            logger.debug("   self_corr not in /check response — retrying /check...")
-            for attempt in range(5):
-                time.sleep(8 + attempt * 4)   # 8s, 12s, 16s, 20s, 24s
-                retry_r = self._safe_get(f"{self.BASE_URL}/alphas/{alpha_id}/check")
-                if retry_r.content:
+        # ── Step 2: Check performance (before vs after) ──
+        team_id = self._get_team_id()
+        if team_id is None:
+            reasons.append("Cannot get team ID for performance check")
+        else:
+            logger.info(f"   📈 Checking performance contribution...")
+            for attempt in range(self.max_retries + 2):
+                perf_r = self._safe_get(
+                    f"{self.BASE_URL}/teams/{team_id}/alphas/{alpha_id}"
+                    f"/before-and-after-performance"
+                )
+                if perf_r.content:
                     try:
-                        retry_checks = retry_r.json().get("is", {}).get("checks", [])
-                        v = _extract_self_corr_from_checks(retry_checks)
-                        if v >= 0:
-                            result["self_corr"] = v
-                            logger.debug(
-                                f"   self_corr from /check retry "
-                                f"(attempt {attempt+1}): {v:.4f}"
+                        score = perf_r.json().get("score", {})
+                        if "before" in score and "after" in score:
+                            result["performance_before"] = float(score["before"])
+                            result["performance_after"] = float(score["after"])
+                            result["performance_gain"] = (
+                                result["performance_after"]
+                                - result["performance_before"]
                             )
+                            performance_available = True
                             break
                     except Exception:
                         pass
-                logger.debug(
-                    f"   /check retry {attempt+1}/5: self_corr still missing"
-                )
+                time.sleep(5)
+            else:
+                reasons.append("Failed to retrieve performance data")
 
-        # ── Fallback: dedicated /correlations/self endpoint ──
-        if result["self_corr"] < 0:
-            logger.debug("   Falling back to /correlations/self endpoint...")
-            result["self_corr"] = self.get_self_correlation(alpha_id)
-
-        logger.info(f"   📊 Self-correlation: {result['self_corr']:.4f}")
-
-        if result["self_corr"] >= max_self_corr:
-            result["reason"] = (
-                f"Self-correlation {result['self_corr']:.4f} >= {max_self_corr}"
+            logger.info(
+                f"   📈 Performance: {result['performance_before']:.1f} → "
+                f"{result['performance_after']:.1f} "
+                f"(+{result['performance_gain']:.1f})"
             )
-            return result
 
-        # ── Step 3: Check performance (before vs after) ──
-        team_id = self._get_team_id()
-        if team_id is None:
-            result["reason"] = "Cannot get team ID for performance check"
-            return result
-
-        logger.info(f"   📈 Checking performance contribution...")
-        for attempt in range(self.max_retries + 2):
-            perf_r = self._safe_get(
-                f"{self.BASE_URL}/teams/{team_id}/alphas/{alpha_id}"
-                f"/before-and-after-performance"
-            )
-            if perf_r.content:
-                try:
-                    score = perf_r.json().get("score", {})
-                    if "before" in score and "after" in score:
-                        result["performance_before"] = float(score["before"])
-                        result["performance_after"] = float(score["after"])
-                        result["performance_gain"] = (
-                            result["performance_after"]
-                            - result["performance_before"]
-                        )
-                        break
-                except Exception:
-                    pass
-            time.sleep(5)
-        else:
-            result["reason"] = "Failed to retrieve performance data"
-            return result
-
-        logger.info(
-            f"   📈 Performance: {result['performance_before']:.1f} → "
-            f"{result['performance_after']:.1f} "
-            f"(+{result['performance_gain']:.1f})"
-        )
-
-        if result["performance_gain"] < min_performance_gain:
-            result["reason"] = (
+        if performance_available and result["performance_gain"] < min_performance_gain:
+            reasons.append(
                 f"Performance gain {result['performance_gain']:.1f} "
                 f"< {min_performance_gain}"
             )
-            return result
 
         # ── All checks passed ──
-        result["ready"] = True
+        result["ready"] = not reasons
+        result["reason"] = "; ".join(reasons)
         return result
 
     def submit_alpha(self, alpha_id: str, skip_checks: bool = False) -> bool:
@@ -679,9 +662,12 @@ class WQBrainClient:
         Submit an alpha for production, with pre-submission safety checks.
 
         Checks before submitting:
-        1. All IS checks must pass
-        2. Self-correlation < 0.7
-        3. Performance contribution > 100
+        1. All non-self-correlation IS checks must pass
+        2. Performance contribution > 100
+
+        Self-correlation is recorded when immediately available, but it is not
+        retried here; the platform still enforces its own final submission
+        rules when the alpha is submitted.
 
         Args:
             alpha_id: The alpha ID to submit.

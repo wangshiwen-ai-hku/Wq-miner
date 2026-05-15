@@ -37,6 +37,7 @@ class FeedbackRecord:
     status: str = "PENDING"          # PASS / FAIL / ERROR / PENDING
     failed_checks: List[str] = field(default_factory=list)
     alpha_link: str = ""
+    error_message: str = ""
 
     # Submission-gate metrics (only populated for IS-passing alphas via
     # check_submission_readiness — sentinel -1.0 means "not measured")
@@ -53,30 +54,40 @@ class FeedbackRecord:
 
     def classify(self) -> str:
         """Classify into feedback bucket."""
+        normalized_failed = {
+            c.upper().replace(" ", "_") for c in self.failed_checks
+        }
+        blocking_failed = normalized_failed - {"SELF_CORRELATION"}
+
         if self.status == "ERROR":
             self.bucket = "error"
+        elif (
+            "SELF_CORRELATION" in normalized_failed
+            and not blocking_failed
+            and self.sharpe >= 1.25
+            and self.fitness >= 1.0
+            and self.performance_gain > 100.0
+        ):
+            self.bucket = "landed"
         elif self.status == "PASS" and not self.failed_checks:
             if self.sharpe >= 1.25 and self.fitness >= 1.0:
-                # Pool admission is decoupled from auto-submission:
-                #   - Pool bar: self_corr < 0.7 (matches platform's hard gate)
-                #   - Auto-submit bar (in agent.py): stricter 0.6 + perf_gain ≥ 150
-                # Seed pool tolerates 0.6 ≤ self_corr < 0.7 because min-corr
-                # sampling enforces diversity at pairing time.
-                # When self_corr wasn't measured (-1, API hiccup), fall back
-                # to perf_gain as a proxy — strong perf overrides unknown corr.
-                if 0 <= self.self_corr < 0.7:
+                # Seed admission prioritizes performance contribution. The
+                # self-corr value is often missing/slow immediately after sim;
+                # if perf_gain > 100, treat it as seed-worthy. If perf was not
+                # measured, a present low self_corr can still land.
+                if self.performance_gain > 100.0:
+                    self.bucket = "landed"
+                elif 0 <= self.self_corr < 0.7:
                     self.bucket = "landed"
                 else:
-                    # self_corr >= 0.7 (too correlated) or
-                    # self_corr == -1 (measurement failed after retries) → reject
                     self.bucket = "landed_but_correlated"
             else:
                 self.bucket = "strong_not_landed"
-        elif "SELF_CORRELATION" in self.failed_checks:
+        elif "SELF_CORRELATION" in normalized_failed:
             self.bucket = "self_corr_trap"
-        elif "HIGH_TURNOVER" in [c.upper().replace(" ", "_") for c in self.failed_checks]:
+        elif "HIGH_TURNOVER" in normalized_failed:
             self.bucket = "high_turnover"
-        elif "CONCENTRATED_WEIGHT" in [c.upper().replace(" ", "_") for c in self.failed_checks]:
+        elif "CONCENTRATED_WEIGHT" in normalized_failed:
             self.bucket = "weight_concentration"
         elif self.sharpe < 0.75:
             self.bucket = "low_sharpe"
@@ -126,7 +137,6 @@ class FeedbackMemory:
             return ""
 
         lines = []
-
         # Recent successes
         successes = [r for r in self.records if r.bucket in ("landed", "strong_not_landed")]
         if successes:
@@ -174,6 +184,16 @@ class FeedbackMemory:
             lines.append("\n### AVOID — Low Sharpe Patterns:")
             for r in low_sharpe[-3:]:
                 lines.append(f"- {r.expression[:60]}... (Sharpe={r.sharpe:.2f})")
+
+        # Simulation syntax/operator errors
+        error_records = [r for r in self.records if r.status == "ERROR" and r.error_message]
+        if error_records:
+            lines.append("\n### AVOID — Recent Simulation Errors:")
+            for r in error_records[-5:]:
+                lines.append(
+                    f"- [{r.mutation_mode}] {r.error_message[:120]} "
+                    f"| expr={r.expression[:70]}..."
+                )
 
         # Tag-pair specific history
         if tag_pair:
@@ -298,6 +318,9 @@ class FeedbackMemory:
 MUTATION_MODES_DEFAULT = [
     "mild_corr_breaker",
     "yield_plus_improvement",
+    "operator_family_rotation",
+    "relationship_residual",
+    "extreme_state_rewrite",
     "weak_gate_hybrid",
     "regime_hybrid",
     "conditional_activation",

@@ -16,19 +16,31 @@ import logging
 import random
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import pandas as pd
 
 from .wq_client import WQBrainClient, SimulationResult
 from .seed_pool import SeedPool, Pair
 from .seed_validator import SeedValidator, ValidationThreshold
-from .llm_hybridizer import GeminiHybridizer, HybridCandidate, MUTATION_MODES
+from .llm_hybridizer import GeminiHybridizer, HybridCandidate, MUTATION_MODES, SYSTEM_PROMPT
 from .feedback_memory import FeedbackMemory, FeedbackRecord, MUTATION_MODES_DEFAULT
+from .prompt_evolver import PromptLibrary
 
 logger = logging.getLogger(__name__)
+
+
+DIVERSITY_MUTATION_MODES = [
+    "operator_family_rotation",
+    "relationship_residual",
+    "extreme_state_rewrite",
+    "orthogonal_residual_rewrite",
+    "dataset_pivot_same_thesis",
+    "mechanism_switch",
+]
 
 
 class AlphaMiningAgent:
@@ -57,12 +69,16 @@ class AlphaMiningAgent:
         validate_candidates: bool = True,
         validation_min_batch: int = 10,
         force_validate_now: bool = False,
+        llm_workers: int = 4,
+        prompt_evolution_interval: int = 2,
     ):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.dry_run = dry_run
         self.pairs_per_round = pairs_per_round
         self.modes_per_pair = modes_per_pair
+        self.llm_workers = max(1, llm_workers)
+        self.prompt_evolution_interval = max(1, prompt_evolution_interval)
 
         # Initialize components
         logger.info("=" * 60)
@@ -91,11 +107,25 @@ class AlphaMiningAgent:
             self.feedback.load()
         logger.info(f"🧠 Feedback memory: {len(self.feedback.records)} records")
 
+        # Versioned prompt/mode library. The bootstrap defaults remain in
+        # llm_hybridizer.py, but all live generation reads from this file.
+        self.prompt_library = PromptLibrary(
+            save_path=str(self.data_dir / "prompt_versions.json"),
+            default_system_prompt=SYSTEM_PROMPT,
+            default_mutation_modes=MUTATION_MODES,
+        )
+        logger.info(
+            "📜 Active prompt version: %s (%d modes)",
+            self.prompt_library.current_version_id,
+            len(self.prompt_library.mutation_modes),
+        )
+
         # LLM hybridizer
         try:
             self.hybridizer = GeminiHybridizer(
                 api_key=gemini_api_key,
                 model_name=gemini_model,
+                prompt_library=self.prompt_library,
             )
             self._use_llm = True
         except ValueError as e:
@@ -208,64 +238,73 @@ class AlphaMiningAgent:
         # (which was happening: every round was mild_corr_breaker +
         # yield_plus_improvement, both "preservation-heavy" mutations
         # that inherit parent A's structure → high prod-book correlation).
-        all_modes = list(MUTATION_MODES.keys())
+        all_modes = list(self.prompt_library.mutation_modes.keys())
 
         if self.feedback.records and self.modes_per_pair > 1:
             exploit_n = max(1, self.modes_per_pair - 1)
-            best_modes = self.feedback.get_best_mutation_modes(top_n=exploit_n)
+            best_modes = [
+                m for m in self.feedback.get_best_mutation_modes(top_n=exploit_n)
+                if m in all_modes
+            ]
             # Pad with first defaults if history is too thin
             for m in MUTATION_MODES_DEFAULT:
                 if m not in best_modes and len(best_modes) < exploit_n:
                     best_modes.append(m)
+            for m in all_modes:
+                if m not in best_modes and len(best_modes) < exploit_n:
+                    best_modes.append(m)
 
-            # Reserve 1 exploratory slot — pick a random mode NOT in best_modes
+            # Reserve 1 exploratory slot. Prefer operator-diversity modes so
+            # exploration does not collapse back to rank/decay wrappers.
             explore_candidates = [m for m in all_modes if m not in best_modes]
-            if explore_candidates:
+            diversity_candidates = [
+                m for m in DIVERSITY_MUTATION_MODES
+                if m in explore_candidates
+            ]
+            if diversity_candidates:
+                best_modes.append(random.choice(diversity_candidates))
+            elif explore_candidates:
                 best_modes.append(random.choice(explore_candidates))
         elif self.feedback.records:
             # Only 1 slot — still alternate exploit/explore by coin flip
-            top1 = self.feedback.get_best_mutation_modes(top_n=1)
+            top1 = [
+                m for m in self.feedback.get_best_mutation_modes(top_n=1)
+                if m in all_modes
+            ]
+            diversity_candidates = [
+                m for m in DIVERSITY_MUTATION_MODES
+                if m in all_modes
+            ]
             if random.random() < 0.5 and top1:
                 best_modes = top1
+            elif diversity_candidates:
+                best_modes = [random.choice(diversity_candidates)]
             else:
                 best_modes = [random.choice(all_modes)]
         else:
-            best_modes = MUTATION_MODES_DEFAULT[:self.modes_per_pair]
+            default_modes = [
+                m for m in MUTATION_MODES_DEFAULT
+                if m in self.prompt_library.mutation_modes
+            ]
+            best_modes = (default_modes or all_modes)[:self.modes_per_pair]
 
         logger.info(f"\n🎯 Mutation modes for this round: {best_modes}")
 
         # Step 3: Generate candidates
         logger.info(f"\n✨ Generating hybrid candidates...")
-        all_candidates: List[HybridCandidate] = []
-
-        for pair in pairs:
-            candidates = []
-
-            if self._use_llm and self.hybridizer:
-                feedback_ctx = self.feedback.get_context_for_prompt(
-                    tag_pair=pair.tag_pair, max_records=6
-                )
-                candidates = self.hybridizer.generate_batch(
-                    parent_a=pair.a.expression,
-                    parent_b=pair.b.expression,
-                    tag_pair=pair.tag_pair,
-                    pair_id=pair.pair_id,
-                    modes=best_modes,
-                    feedback_context=feedback_ctx,
-                )
-
-            # Fallback: if LLM produced 0 candidates, use templates
-            if not candidates:
-                logger.info(
-                    f"   ⚡ LLM returned 0 candidates for {pair.pair_id}, "
-                    f"falling back to template generation"
-                )
-                candidates = self._template_generate(pair, best_modes)
-
-            all_candidates.extend(candidates)
-            logger.info(
-                f"   Pair {pair.pair_id}: generated {len(candidates)} candidates"
+        if self._use_llm and self.hybridizer:
+            all_candidates = self._generate_llm_candidates_parallel(
+                pairs=pairs,
+                modes=best_modes,
             )
+        else:
+            all_candidates = []
+            for pair in pairs:
+                candidates = self._template_generate(pair, best_modes)
+                all_candidates.extend(candidates)
+                logger.info(
+                    f"   Pair {pair.pair_id}: generated {len(candidates)} candidates"
+                )
 
         logger.info(f"\n📦 Total candidates: {len(all_candidates)}")
 
@@ -316,35 +355,35 @@ class AlphaMiningAgent:
                 status=sim_result.status,
                 failed_checks=sim_result.failed_checks,
                 alpha_link=sim_result.alpha_link,
+                error_message=sim_result.error_message,
             )
             record.classify()
 
-            # For IS-passing alphas, also probe the submission gates
-            # (self-correlation + performance gain). This is a few extra API
-            # calls — we already wanted these values for auto-submit, now we
-            # just persist them so the LLM can learn to decorrelate. After
-            # this we re-classify so `landed_but_correlated` is populated
-            # *before* the record goes into feedback memory.
+            # For every PASS alpha, probe performance contribution. Self-corr
+            # is recorded only if present in the initial /check response; it is
+            # no longer retried or used as the seed-pool blocker. After this
+            # we re-classify so perf_gain > 100 can promote to `landed`.
             readiness = None
-            _is_candidate = (
-                sim_result.status == "PASS"
-                and not sim_result.failed_checks
-                and sim_result.sharpe >= 1.25
-                and sim_result.fitness >= 1.0
+            failed_normalized = {
+                c.upper().replace(" ", "_") for c in sim_result.failed_checks
+            }
+            self_corr_only_fail = (
+                "SELF_CORRELATION" in failed_normalized
+                and not (failed_normalized - {"SELF_CORRELATION"})
             )
+            _should_probe_perf = sim_result.status == "PASS" or self_corr_only_fail
             if (
                 not self.dry_run
                 and sim_result.alpha_id
-                and _is_candidate
+                and _should_probe_perf
             ):
                 logger.info(
-                    f"   🔍 Probing submission gates for {sim_result.alpha_id}..."
+                    f"   🔍 Probing performance gate for {sim_result.alpha_id}..."
                 )
                 try:
                     readiness = self.wq_client.check_submission_readiness(
                         alpha_id=sim_result.alpha_id,
-                        max_self_corr=0.6,
-                        min_performance_gain=150.0,
+                        min_performance_gain=100.0,
                     )
                     record.self_corr = readiness.get("self_corr", -1.0)
                     record.performance_before = readiness.get("performance_before", 0.0)
@@ -357,12 +396,12 @@ class AlphaMiningAgent:
                         f"perf_gain={record.performance_gain:.1f}, "
                         f"→ bucket={record.bucket}"
                     )
+                    if readiness.get("reason"):
+                        logger.info(f"   Gate reason: {readiness['reason']}")
                 except Exception as e:
                     logger.warning(f"   ⚠️ Readiness probe failed: {e}")
 
-            # Only add to feedback memory if it's a valid evaluation (not an API/concurrency error)
-            if record.bucket != "error":
-                self.feedback.add_record(record)
+            self.feedback.add_record(record)
 
             results.append({
                 "round": round_id,
@@ -376,7 +415,13 @@ class AlphaMiningAgent:
                 "returns": sim_result.returns,
                 "status": sim_result.status,
                 "bucket": record.bucket,
+                "self_corr": record.self_corr,
+                "performance_before": record.performance_before,
+                "performance_after": record.performance_after,
+                "performance_gain": record.performance_gain,
+                "submission_ready": record.submission_ready,
                 "failed_checks": "; ".join(sim_result.failed_checks),
+                "error_message": sim_result.error_message,
                 "alpha_link": sim_result.alpha_link,
             })
 
@@ -388,9 +433,8 @@ class AlphaMiningAgent:
             # Explicitly excluded:
             #   - strong_not_landed: passes IS checks but sharpe/fitness too
             #     weak to be a useful parent (would dilute the pool)
-            #   - landed_but_correlated: high-quality IS signal BUT overlaps
-            #     the user's prod book — every child would inherit that
-            #     correlation, defeating the decorrelation goal
+            #   - landed_but_correlated: high-quality IS signal with neither
+            #     measurable perf_gain > 100 nor known low self_corr
             #
             # These still enter feedback memory so the LLM learns from them;
             # they just don't become future parents.
@@ -414,7 +458,7 @@ class AlphaMiningAgent:
                 if record.submission_ready and sim_result.alpha_id:
                     logger.info(
                         f"   ✅ All gates passed! Submitting...\n"
-                        f"      Self-corr: {record.self_corr:.4f} (<0.7 ✓)\n"
+                        f"      Self-corr: {record.self_corr:.4f} (recorded only)\n"
                         f"      Perf gain: +{record.performance_gain:.1f} (>100 ✓)"
                     )
                     submitted = self.wq_client.submit_alpha(
@@ -430,6 +474,16 @@ class AlphaMiningAgent:
         # Step 5: Save state
         self.seed_pool.save()
         self.feedback.save()
+        evolved_version = self.prompt_library.evolve_from_feedback(
+            self.feedback.records,
+            round_id=round_id,
+            evolution_interval=self.prompt_evolution_interval,
+        )
+        if evolved_version:
+            logger.info(
+                "🧬 Next round will use prompt version %s",
+                evolved_version.version_id,
+            )
 
         # Step 6: Round summary
         result_df = pd.DataFrame(results)
@@ -441,6 +495,88 @@ class AlphaMiningAgent:
         logger.info(f"\n💾 Results saved to: {csv_path}")
 
         return result_df
+
+    def _generate_llm_candidates_parallel(
+        self,
+        pairs: List[Pair],
+        modes: List[str],
+    ) -> List[HybridCandidate]:
+        """Generate LLM candidates across all pair/mode tasks in parallel."""
+        total_tasks = len(pairs) * len(modes)
+        max_workers = min(self.llm_workers, total_tasks) if total_tasks else 1
+        logger.info(
+            "   🚀 Parallel LLM generation: %d tasks, max_workers=%d",
+            total_tasks,
+            max_workers,
+        )
+
+        feedback_by_pair = {
+            pair.pair_id: self.feedback.get_context_for_prompt(
+                tag_pair=pair.tag_pair,
+                max_records=6,
+            )
+            for pair in pairs
+        }
+        candidates_by_pair: Dict[str, List[HybridCandidate]] = {
+            pair.pair_id: [] for pair in pairs
+        }
+
+        def _generate_one(pair: Pair, mode: str) -> Optional[HybridCandidate]:
+            return self.hybridizer.generate_hybrid(
+                parent_a=pair.a.expression,
+                parent_b=pair.b.expression,
+                tag_pair=pair.tag_pair,
+                pair_id=pair.pair_id,
+                mutation_mode=mode,
+                feedback_context=feedback_by_pair[pair.pair_id],
+            )
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_map = {
+                pool.submit(_generate_one, pair, mode): (pair.pair_id, mode)
+                for pair in pairs
+                for mode in modes
+            }
+            completed = 0
+            for future in as_completed(future_map):
+                pair_id, mode = future_map[future]
+                completed += 1
+                try:
+                    candidate = future.result()
+                except Exception as e:
+                    logger.warning(
+                        "   ❌ LLM task failed [%s/%s]: %s",
+                        pair_id,
+                        mode,
+                        e,
+                    )
+                    continue
+                if candidate:
+                    candidates_by_pair[pair_id].append(candidate)
+                logger.info(
+                    "   [%d/%d] LLM task done pair=%s mode=%s success=%s",
+                    completed,
+                    total_tasks,
+                    pair_id,
+                    mode,
+                    bool(candidate),
+                )
+
+        all_candidates: List[HybridCandidate] = []
+        for pair in pairs:
+            candidates = candidates_by_pair[pair.pair_id]
+            if not candidates:
+                logger.info(
+                    f"   ⚡ LLM returned 0 candidates for {pair.pair_id}, "
+                    f"falling back to template generation"
+                )
+                candidates = self._template_generate(pair, modes)
+            all_candidates.extend(candidates)
+            logger.info(
+                f"   Pair {pair.pair_id}: generated {len(candidates)} candidates"
+            )
+
+        return all_candidates
 
     def run_evolution(self, n_rounds: int = 3) -> pd.DataFrame:
         """
@@ -672,6 +808,30 @@ class AlphaMiningAgent:
                 f"if_else(rank({b}) > 0.3, group_rank({a}, subindustry), 0)",
                 "Activate A only when B exceeds a threshold."
             ),
+            "operator_family_rotation": (
+                f"group_zscore(ts_zscore({a}, 126) + 0.2 * ts_quantile({b}, 63), subindustry)",
+                "Use distribution-shape operators instead of the default rank/decay scaffold."
+            ),
+            "relationship_residual": (
+                f"ts_corr(ts_zscore({a}, 126), ts_zscore({b}, 126), 63)",
+                "Use a relationship signal between normalized A and B without inaccessible operators."
+            ),
+            "extreme_state_rewrite": (
+                f"if_else(ts_arg_min({b}, 63) < 10, hump({a}, 0.01), ts_zscore({a}, 126))",
+                "Use B's extreme-state timing and smooth A instead of rank-decay wrappers."
+            ),
+            "orthogonal_residual_rewrite": (
+                f"group_zscore(ts_zscore({a}, 126) - ts_corr({a}, {b}, 63), subindustry)",
+                "Rewrite A using a compact correlation adjustment against B."
+            ),
+            "dataset_pivot_same_thesis": (
+                f"group_zscore(ts_zscore({a}, 252) + 0.2 * ts_av_diff({b}, 126), subindustry)",
+                "Keep the thesis while changing the operator family and time-series transform."
+            ),
+            "mechanism_switch": (
+                f"if_else(ts_zscore({b}, 126) > 0, ts_scale({a}, 126), -0.5 * ts_scale({a}, 126))",
+                "Switch from linear blend to regime segmentation with scale-based transforms."
+            ),
         }
         candidates = []
         for mode in modes:
@@ -754,11 +914,19 @@ def main():
         help="Number of mutation modes per pair (default: 2)"
     )
     parser.add_argument(
+        "--llm-workers", type=int, default=4,
+        help="Max parallel Gemini generation workers (default: 4)"
+    )
+    parser.add_argument(
+        "--prompt-evolution-interval", type=int, default=2,
+        help="Update prompt/mode version every N rounds (default: 2)"
+    )
+    parser.add_argument(
         "--credentials", type=str, default="credentials.json",
         help="Path to WQ Brain credentials JSON"
     )
     parser.add_argument(
-        "--gemini-model", type=str, default="gemini-3-flash-preview",
+        "--gemini-model", type=str, default="gemini-2.5-flash",
         help="Gemini model name (default: gemini-2.5-flash)"
     )
     parser.add_argument(
@@ -821,6 +989,8 @@ def main():
         validate_candidates=not args.skip_validation,
         validation_min_batch=args.validation_min_batch,
         force_validate_now=args.validate_now,
+        llm_workers=args.llm_workers,
+        prompt_evolution_interval=args.prompt_evolution_interval,
     )
 
     if args.continuous:
@@ -841,4 +1011,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

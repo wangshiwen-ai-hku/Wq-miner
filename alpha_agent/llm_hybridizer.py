@@ -14,11 +14,14 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
+
+from .prompt_evolver import PromptLibrary
 
 load_dotenv()
 
@@ -64,6 +67,24 @@ MUTATION_MODES = {
         "Different from weak_gate: the condition should be economically meaningful. "
         "Example: if_else(ts_delta(est_eps, 126) > 0, group_rank(A, subindustry), 0)"
     ),
+    "operator_family_rotation": (
+        "Generate a structurally novel child by avoiding the crowded default wrappers "
+        "group_rank(), ts_rank(), ts_decay_linear(), and group_neutralize() unless one "
+        "is strictly necessary. Use at least one underused family: ts_zscore/ts_quantile/"
+        "ts_scale, ts_corr/ts_covariance, ts_arg_max/ts_arg_min, "
+        "ts_std_dev/ts_av_diff, days_from_last_change/last_diff_value, or bucket/winsorize."
+    ),
+    "relationship_residual": (
+        "Make B a relationship or residualization component rather than a direct additive "
+        "modifier. Prefer ts_corr or ts_covariance with exactly 3 inputs: x, y, d. "
+        "Avoid vector_neut; it is inaccessible in this environment. Avoid ts_regression "
+        "unless you can keep the call to the platform-supported argument count."
+    ),
+    "extreme_state_rewrite": (
+        "Rewrite A around extremes or state persistence instead of ranks. Prefer ts_arg_max, "
+        "ts_arg_min, ts_max, ts_min, days_from_last_change, last_diff_value, bucket, or "
+        "hump. Keep the expression compact and avoid default rank-decay wrappers."
+    ),
 }
 
 
@@ -81,13 +102,16 @@ Given two parent alpha expressions (A and B), generate a hybrid child alpha that
 Available operators (use ONLY these):
 - Rank: rank(x), group_rank(x, group), ts_rank(x, d)
 - Time series: ts_delta(x, d), ts_mean(x, d), ts_sum(x, d), ts_std_dev(x, d), ts_decay_linear(x, d, dense=false), ts_zscore(x, d), ts_rank(x, d), ts_backfill(x, d), ts_corr(x, y, d), ts_covariance(x, y, d), ts_arg_max(x, d), ts_arg_min(x, d), ts_max(x, d), ts_min(x, d), ts_product(x, d), ts_skewness(x, d), ts_kurtosis(x, d), ts_av_diff(x, d), ts_quantile(x, d), ts_scale(x, d), ts_regression(y, x, d, lag=0, rettype=0)
-- Turnover control: hump(x, hump=0.01), jump_decay(x, d, sensitivity=0.5, force=0.1), ts_target_tvr_decay(x, target_tvr=0.1)
+- Turnover control: hump(x, hump=0.01), jump_decay(x, d, sensitivity=0.5, force=0.1)
 - Group: group_rank(x, group), group_neutralize(x, group), group_zscore(x, group), group_mean(x, N, group), group_sum(x, group), group_scale(x, group)
 - Conditional: if_else(cond, true_val, false_val), trade_when(cond, signal, default)
 - Math: abs(x), log(x), sign(x), power(x, p), max(x, y), min(x, y), signed_power(x, p), sqrt(x)
 - Transform: rank(x), scale(x), sigmoid(x), pasteurize(x), winsorize(x, std=N), normalize(x), zscore(x), quantile(x), bucket(rank(x), range="0,1,0.1")
-- Utility: days_from_last_change(x), last_diff_value(x, d), vector_neut(x, y), ts_step(1)
+- Utility: days_from_last_change(x), last_diff_value(x, d), ts_step(1)
 - Groups: market, sector, industry, subindustry, densify(group_field)
+
+## Unavailabel Operators ERROR
+[ERROR] Simulation error: Attempted to use inaccessible or unknown operator "ts_target_tvr_decay". <linkToCommonErrorMessages>Learn more</linkToCommonErrorMessages>
 
 ## Available Data Fields
 - Price: open, high, low, close, vwap, returns, volume, adv20, cap
@@ -103,10 +127,12 @@ Available operators (use ONLY these):
 3. Use subindustry/industry neutralization for fundamental factors
 4. Low-frequency fields (fundamental, mdf_*, fnd6_*) should use ts_rank with 126/252 day windows
 5. Do NOT use short windows (5/10/21) on fundamental or MDF fields — they update quarterly
-6. Avoid turnover > 50%. Use hump(), ts_decay_linear, or ts_target_tvr_decay for smoothing
+6. Avoid turnover > 50%. Use hump(), jump_decay(), or moderate-window ts_decay_linear only when needed for smoothing. Do NOT use ts_target_tvr_decay; it is inaccessible in this environment.
 7. The final expression must be valid WorldQuant Fast Expression syntax
 8. When using mdf_* or fnd6_* fields, always wrap in rank() or group_rank() to avoid weight concentration
 9. **OPERATOR BUDGET ≤ 64**: WorldQuant rejects expressions with more than 64 operators (each function call like rank, ts_rank, group_neutralize, if_else, +, -, *, / counts as one operator). Keep the expression compact — prefer 2-4 layers of nesting over deeply chained transforms. If a hybrid is getting long, drop a redundant rank() or fold two ts_* calls into one.
+10. **OPERATOR DIVERSITY**: group_rank(), ts_rank(), ts_decay_linear(), rank(), and group_neutralize() are crowded defaults. Use at most two of these crowded operators in an exploratory child, and prefer one underused operator family when syntactically valid: ts_zscore/ts_quantile/ts_scale, ts_corr/ts_covariance, ts_arg_max/ts_arg_min/ts_max/ts_min, ts_std_dev/ts_av_diff/ts_skewness, days_from_last_change/last_diff_value, bucket/winsorize/normalize/group_zscore.
+11. **AVOID LIVE ERRORS**: Do NOT use vector_neut; live WQ simulation reports it as inaccessible. For relationship operators, prefer ts_corr(x, y, d) or ts_covariance(x, y, d). Avoid complex ts_regression signatures unless already proven by simulation.
 
 ## Known Failure Patterns (AVOID THESE)
 - Adding rank(-ts_decay_linear(returns, 5)) blindly — high self-correlation with existing alphas
@@ -114,6 +140,7 @@ Available operators (use ONLY these):
 - revenue/cap, ebitda/cap, retained_earnings/cap — weak predictors
 - Short ts_delta on quarterly fields — produces noise
 - Weight concentration from unbounded ratios — always wrap in rank() or group_rank()
+- Reusing the same scaffold every round: group_rank(ts_rank(...)+...), ts_decay_linear(group_neutralize(...)), or A * (1 + k * rank(B)). These are now crowded patterns and should be rationed.
 """
 
 
@@ -123,10 +150,12 @@ def _build_generation_prompt(
     tag_pair: str,
     mutation_mode: str,
     feedback_context: str = "",
+    mutation_modes: Optional[Dict[str, str]] = None,
 ) -> str:
     """Build the user prompt for Gemini."""
 
-    mode_desc = MUTATION_MODES.get(mutation_mode, "Use your best judgment for hybridization.")
+    modes = mutation_modes or MUTATION_MODES
+    mode_desc = modes.get(mutation_mode, "Use your best judgment for hybridization.")
 
     prompt = f"""## Parent Expressions
 
@@ -172,6 +201,8 @@ class GeminiHybridizer:
         api_key: Optional[str] = None,
         model_name: str = "gemini-2.5-flash",
         temperature: float = 0.8,
+        prompt_library: Optional[PromptLibrary] = None,
+        prompt_version_path: str = "data/prompt_versions.json",
     ):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         if not self.api_key:
@@ -181,7 +212,13 @@ class GeminiHybridizer:
 
         self.model_name = model_name
         self.temperature = temperature
+        self.prompt_library = prompt_library or PromptLibrary(
+            save_path=prompt_version_path,
+            default_system_prompt=SYSTEM_PROMPT,
+            default_mutation_modes=MUTATION_MODES,
+        )
         self._client = None
+        self._thread_local = threading.local()
         self._init_client()
 
     def _init_client(self):
@@ -193,6 +230,18 @@ class GeminiHybridizer:
         except Exception as e:
             logger.error(f"Failed to initialize Gemini: {e}")
             raise
+
+    def _get_client(self):
+        """Return a Gemini client scoped to the current thread."""
+        client = getattr(self._thread_local, "client", None)
+        if client is not None:
+            return client
+        if threading.current_thread() is threading.main_thread():
+            return self._client
+        from google import genai
+        client = genai.Client(api_key=self.api_key)
+        self._thread_local.client = client
+        return client
 
     def generate_hybrid(
         self,
@@ -219,11 +268,15 @@ class GeminiHybridizer:
         Returns:
             HybridCandidate or None if generation fails.
         """
-        from google import genai
         from google.genai import types
 
         prompt = _build_generation_prompt(
-            parent_a, parent_b, tag_pair, mutation_mode, feedback_context
+            parent_a,
+            parent_b,
+            tag_pair,
+            mutation_mode,
+            feedback_context,
+            mutation_modes=self.prompt_library.mutation_modes,
         )
 
         for attempt in range(max_retries):
@@ -233,11 +286,11 @@ class GeminiHybridizer:
                     f"(attempt {attempt+1}/{max_retries})..."
                 )
 
-                response = self._client.models.generate_content(
+                response = self._get_client().models.generate_content(
                     model=self.model_name,
                     contents=prompt,
                     config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_PROMPT,
+                        system_instruction=self.prompt_library.system_prompt,
                         temperature=self.temperature,
                         max_output_tokens=8192,
                     ),
@@ -295,7 +348,7 @@ class GeminiHybridizer:
     ) -> List[HybridCandidate]:
         """Generate multiple candidates using different mutation modes."""
         if modes is None:
-            modes = list(MUTATION_MODES.keys())
+            modes = list(self.prompt_library.mutation_modes.keys())
 
         logger.info(
             f"   📦 Generating batch for pair {pair_id} "
