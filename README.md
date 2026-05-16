@@ -55,6 +55,55 @@ caffeinate -i bash run_loop.sh
 - **`run_loop.sh`**: 核心运行脚本，默认每 120 秒开启一轮挖掘。
 - **`run_agent.py`**: 单次运行的入口，可通过参数控制轮次和模拟密度。
 
+### 记录已提交 Alpha
+
+挖掘 Agent 在每次非 dry-run 启动时，会先刷新一份当前账号已提交 Alpha 的记录：
+
+```bash
+data/submitted_alphas.csv
+```
+
+也可以单独运行这个工具：
+
+```bash
+python -m alpha_agent.submitted_alpha_tool --credentials credentials.json
+```
+
+该 CSV 只保存平台上可见的 Alpha 字段、settings、IS/OS 表现和检查摘要，不保存接口错误信息或调试字段。
+
+### 自然语言检索 Data Fields
+
+可以用自然语言描述研究方向或市场假说，工具会登录 WorldQuant Brain，先解析字段需求，再检索真实可用字段：
+
+```bash
+python -m alpha_agent.datafield_tool \
+  -s "Find datafields related to:
+[analyst, estimate, revision, downgrade, upgrade, EPS, revenue estimate, target price, recommendation, earnings surprise, dispersion]
+
+Exclude datafields related to:
+[price, return, volume, vwap, currency, identifier, metadata, reporting currency]
+
+Return:
+field_name, dataset, description, coverage, delay, userCount, alphaCount"
+```
+
+默认保存为 JSON 到 `data/datafields/`，结构为 `request`、`plan`、`summary`、`fields`。也可以指定输出：
+
+```bash
+python -m alpha_agent.datafield_tool \
+  -s "Find datafields related to:
+[ownership, buyback, dividend, capex, accrual, earnings quality]
+
+Exclude datafields related to:
+[price, return, volume, currency, identifier]
+
+Return:
+field_name, dataset, description, coverage, delay, userCount, alphaCount" \
+  --output data/datafields/capital_quality.json
+```
+
+推荐使用 `Find / Exclude / Return` 三段式 prompt，工具会精确解析 include terms、exclude terms 和输出列。非结构化自然语言仍可用：默认 `--intent-mode auto` 会在可用时使用 Gemini 生成检索计划；否则退回到通用短语解析。需要表格时可加 `--format csv`。
+
 ---
 
 ## 🌱 种子池管理 (Seed Pool)

@@ -29,6 +29,7 @@ from .seed_validator import SeedValidator, ValidationThreshold
 from .llm_hybridizer import GeminiHybridizer, HybridCandidate, MUTATION_MODES, SYSTEM_PROMPT
 from .feedback_memory import FeedbackMemory, FeedbackRecord, MUTATION_MODES_DEFAULT
 from .prompt_evolver import PromptLibrary
+from .submitted_alpha_tool import save_submitted_alphas
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +141,16 @@ class AlphaMiningAgent:
         if not dry_run:
             self.wq_client = WQBrainClient(credentials_path=credentials_path)
             self.wq_client.login()
+            try:
+                output_path = self.data_dir / "submitted_alphas.csv"
+                save_submitted_alphas(
+                    credentials_path=credentials_path,
+                    output_path=output_path,
+                    session=self.wq_client.session,
+                )
+                logger.info("📬 Submitted alpha record refreshed: %s", output_path)
+            except Exception as e:
+                logger.warning("⚠️ Could not refresh submitted alpha record: %s", e)
         else:
             self.wq_client = None
             logger.info("🏜️ DRY RUN mode — skipping WQ Brain simulation")
